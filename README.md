@@ -1,4 +1,4 @@
-# Merged Ad-Block Rules
+# Merged Ad Rules
 
 Auto-generated daily from multiple upstream lists, deduplicated via a **domain suffix trie** — not just string comparison.
 
