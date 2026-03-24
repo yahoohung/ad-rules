@@ -11,7 +11,7 @@ Auto-generated daily from multiple upstream lists, deduplicated via a **domain s
 Raw URL for Loon / Surge / Shadowrocket:
 
 ```
-https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/output/reject.list
+https://raw.githubusercontent.com/yahoohung/ad-rules/refs/heads/main/output/reject.list
 ```
 
 ## How it works
