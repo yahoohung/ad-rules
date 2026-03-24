@@ -1,0 +1,51 @@
+name: Update Merged Ad-Block Rules
+
+on:
+  schedule:
+    # Run every day at 03:00 UTC (11:00 HKT)
+    - cron: "0 3 * * *"
+  workflow_dispatch:   # allow manual trigger from Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install aiohttp pyyaml
+
+      - name: Run merge script
+        run: python scripts/merge.py
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if git diff --quiet output/reject.list 2>/dev/null && \
+             git ls-files --error-unmatch output/reject.list 2>/dev/null; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push if changed
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/reject.list
+          RULE_COUNT=$(grep -c "^DOMAIN\|^IP-CIDR" output/reject.list || true)
+          git commit -m "chore: update rules [${RULE_COUNT} rules] $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push

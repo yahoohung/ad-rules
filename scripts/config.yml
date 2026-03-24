@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────────────────
+# Rule source configuration
+# To add a list    : append a new "- url: ..." entry
+# To remove a list : delete or comment out the entry
+# To disable a list: add  enabled: false
+# ─────────────────────────────────────────────────────────
+
+sources:
+  - url: https://github.com/QuixoticHeart/rule-set/raw/refs/heads/ruleset/loon/adrules.list
+    note: QuixoticHeart adrules (Loon)
+
+  - url: https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/anti-ad-surge.txt
+    note: anti-AD (Surge)
+
+  - url: https://raw.githubusercontent.com/8680/GOODBYEADS/master/data/rules/qx.list
+    note: GOODBYEADS (QX)
+
+  - url: https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_reject_list.module
+    note: GMOogway Shadowrocket reject list
+
+  - url: https://adrules.top/adrules.list
+    note: adrules.top
+
+  - url: https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockloon.list
+    note: 217heidai adblockfilters (Loon)
+
+  - url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Loon/Advertising/Advertising.list
+    note: blackmatrix7 Advertising (Loon)
