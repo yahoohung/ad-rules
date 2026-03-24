@@ -26,3 +26,12 @@ sources:
 
   - url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Loon/Advertising/Advertising.list
     note: blackmatrix7 Advertising (Loon)
+
+  - url: https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/Filters/AWAvenue-Ads-Rule-Surge.list
+    note: AWAvenue Ads Rule
+
+  - url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Loon/Privacy/Privacy.list
+    note: blackmatrix7 Privacy (Loon)
+  
+  - url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt
+    note: hagezi dns-blocklists (pro)
