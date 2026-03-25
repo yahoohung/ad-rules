@@ -1,454 +1,371 @@
 #!/usr/bin/env python3
 """
-Ad-block rule merger with Trie-based domain deduplication.
-Fetches multiple rule lists, normalises to Loon format,
-removes redundant sub-domains via a suffix trie, then writes
-a single output file.
+Ad-block rule merger for Loon
+- Fetches HTTP sources concurrently (aiohttp) or sequentially (urllib fallback)
+- Reads local file sources (path:)
+- Normalises Loon / Surge / QX / Shadowrocket / ABP / hosts formats → Loon
+- Semantic dedup via reversed-label domain trie (DOMAIN-SUFFIX subsumes DOMAIN)
+- Custom local deny list bypasses trie (always kept)
+- Writes single output/reject.list
 """
 
-from __future__ import annotations
-
 import asyncio
-import ipaddress
 import logging
 import re
 import sys
-import time
-from collections import defaultdict
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Optional
 
-import aiohttp
 import yaml
 
-# ──────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
+    import urllib.request
+
+# ── paths ─────────────────────────────────────────────────────────────────────
+ROOT       = Path(__file__).parent
+SOURCES    = ROOT / "sources.yaml"
+OUTPUT_DIR = ROOT / "output"
+OUTPUT     = OUTPUT_DIR / "reject.list"
+
+# ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("merger")
 
+# ── constants ─────────────────────────────────────────────────────────────────
+TIMEOUT = 30
 
-# ──────────────────────────────────────────────
-# Trie
-# ──────────────────────────────────────────────
-@dataclass
-class TrieNode:
-    children: dict[str, "TrieNode"] = field(default_factory=dict)
-    is_suffix: bool = False   # DOMAIN-SUFFIX node (catches all sub-domains)
-    is_exact:  bool = False   # DOMAIN node
-
-
-class DomainTrie:
-    """
-    Reversed-label trie for domain rules.
-
-    Insertion semantics
-    -------------------
-    DOMAIN-SUFFIX, example.com
-        → path ["com", "example"] → mark is_suffix=True
-        → any future DOMAIN or DOMAIN-SUFFIX that starts with this
-          path is redundant and discarded.
-
-    DOMAIN, ads.example.com
-        → path ["com", "example", "ads"]
-        → if any ancestor node has is_suffix=True → redundant, skip.
-        → otherwise mark is_exact=True on the leaf.
-
-    Pruning on DOMAIN-SUFFIX insertion
-        → when marking a node as is_suffix, delete all its children
-          (they are now subsumed) and clear is_exact on that node.
-    """
-
-    def __init__(self) -> None:
-        self._root = TrieNode()
-
-    # ------------------------------------------------------------------
-    def insert_suffix(self, domain: str) -> bool:
-        """
-        Insert DOMAIN-SUFFIX rule.
-        Returns True if inserted (not redundant), False if discarded.
-        """
-        labels = _reversed_labels(domain)
-        if not labels:
-            return False
-        node = self._root
-        for label in labels:
-            # If any ancestor is already a suffix node → redundant
-            if node.is_suffix:
-                return False
-            node = node.children.setdefault(label, TrieNode())
-        # Reached the target node
-        if node.is_suffix:
-            return False   # exact duplicate
-        # Mark and prune all children (they are now subsumed)
-        node.is_suffix = True
-        node.is_exact  = False
-        node.children.clear()
-        return True
-
-    # ------------------------------------------------------------------
-    def insert_exact(self, domain: str) -> bool:
-        """
-        Insert DOMAIN rule.
-        Returns True if inserted (not redundant), False if discarded.
-        """
-        labels = _reversed_labels(domain)
-        if not labels:
-            return False
-        node = self._root
-        for label in labels:
-            if node.is_suffix:
-                return False   # covered by ancestor suffix rule
-            node = node.children.setdefault(label, TrieNode())
-        if node.is_suffix or node.is_exact:
-            return False
-        node.is_exact = True
-        return True
-
-    # ------------------------------------------------------------------
-    def emit(self) -> Iterator[tuple[str, str]]:
-        """Yield (rule_type, domain) for every surviving rule."""
-        yield from self._walk(self._root, [])
-
-    def _walk(self, node: TrieNode, path: list[str]) -> Iterator[tuple[str, str]]:
-        if node.is_suffix:
-            yield ("DOMAIN-SUFFIX", _join_labels(path))
-            return   # children pruned at insert time
-        if node.is_exact:
-            yield ("DOMAIN", _join_labels(path))
-        for label, child in node.children.items():
-            yield from self._walk(child, [label] + path)
-
-
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
-_VALID_DOMAIN_RE = re.compile(
-    r"^(?:[a-zA-Z0-9\u4e00-\u9fff]"          # IDN support (basic)
-    r"(?:[a-zA-Z0-9\u4e00-\u9fff\-]{0,61}"
-    r"[a-zA-Z0-9\u4e00-\u9fff])?\.)+"
-    r"[a-zA-Z\u4e00-\u9fff]{2,}$"
-)
-
-
-def _is_valid_domain(d: str) -> bool:
-    return bool(_VALID_DOMAIN_RE.match(d))
-
-
-def _reversed_labels(domain: str) -> list[str]:
-    parts = domain.lower().strip(".").split(".")
-    return list(reversed(parts)) if all(parts) else []
-
-
-def _join_labels(reversed_path: list[str]) -> str:
-    return ".".join(reversed_path)
-
-
-def _is_ip(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except ValueError:
-        return False
-
-
-# ──────────────────────────────────────────────
-# Rule parsing / normalisation
-# ──────────────────────────────────────────────
-@dataclass
-class Rule:
-    kind: str    # DOMAIN | DOMAIN-SUFFIX | IP-CIDR | IP-CIDR6 | OTHER
-    value: str
-
-    def __hash__(self):
-        return hash((self.kind, self.value))
-
-    def __eq__(self, other):
-        return (self.kind, self.value) == (other.kind, other.value)
-
-
-# Mapping of alias prefixes → canonical Loon prefixes
-_PREFIX_MAP: dict[str, str] = {
-    "DOMAIN-SUFFIX": "DOMAIN-SUFFIX",
-    "DOMAIN-KEYWORD": "DOMAIN-KEYWORD",
-    "DOMAIN":        "DOMAIN",
+# QX / Shadowrocket prefix → Loon prefix
+_QX_MAP = {
+    "HOST":          "DOMAIN",
     "HOST-SUFFIX":   "DOMAIN-SUFFIX",
     "HOST-KEYWORD":  "DOMAIN-KEYWORD",
-    "HOST":          "DOMAIN",
-    "IP-CIDR6":      "IP-CIDR6",
-    "IP-CIDR":       "IP-CIDR",
-    "IP6-CIDR":      "IP-CIDR6",
+    "HOST-WILDCARD": "DOMAIN-WILDCARD",
 }
 
-# Lines to skip entirely
+_VALID_PREFIXES = {
+    "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-WILDCARD",
+    "IP-CIDR", "IP-CIDR6", "IP-ASN", "GEOIP",
+    "USER-AGENT", "URL-REGEX", "PROCESS-NAME",
+}
+
+# Fast-path skip: blank / comment / section header / ABP exception / cosmetic
 _SKIP_RE = re.compile(
-    r"^(?:#|!|\[|@@|/|\s*$)"   # comments, [section], ABP allowlist, regex
+    r"^\s*($|#|//|;|\[|!|@@|##|#\$|#@|^\|[^|])",
+    re.IGNORECASE,
 )
 
-# ABP-style ||domain.com^  →  DOMAIN-SUFFIX
-_ABP_BLOCK_RE = re.compile(r"^\|\|([^/^*\s]+)\^?$")
+# Pre-compiled splitter for comma-or-space separated rules
+_SPLIT_RE = re.compile(r"[,\s]+")
 
-# QX leading dot:  .example.com  →  DOMAIN-SUFFIX,example.com
-_QX_DOT_RE = re.compile(r"^\.([\w.\-]+)$")
+# Hosts file loopback prefixes to recognise
+_HOSTS_PREFIX = ("0.0.0.0 ", "127.0.0.1 ", "::1 ", "fe80::1%lo0 ")
+
+# Domains to ignore when parsing hosts files
+_HOSTS_SKIP = frozenset({
+    "localhost", "local", "broadcasthost", "0.0.0.0",
+    "ip6-localhost", "ip6-loopback", "ip6-localnet",
+    "ip6-mcastprefix", "ip6-allnodes", "ip6-allrouters",
+})
 
 
-def parse_line(raw: str) -> Optional[Rule]:
+# ── normalisation ─────────────────────────────────────────────────────────────
+def normalise_line(raw: str) -> str | None:
+    """Return canonical Loon rule string, or None to discard."""
     line = raw.strip()
-    if not line or _SKIP_RE.match(line):
+
+    if _SKIP_RE.match(line):
         return None
 
     # Strip inline comments
-    line = re.split(r"\s+#", line)[0].strip()
-    line = re.split(r"\s+//", line)[0].strip()
-
-    # ABP-style
-    m = _ABP_BLOCK_RE.match(line)
-    if m:
-        domain = m.group(1).lower()
-        if _is_valid_domain(domain):
-            return Rule("DOMAIN-SUFFIX", domain)
+    line = re.split(r"\s+#|\s+//", line)[0].strip()
+    if not line:
         return None
 
-    # QX leading-dot style
-    m = _QX_DOT_RE.match(line)
-    if m:
-        domain = m.group(1).lower()
-        if _is_valid_domain(domain):
-            return Rule("DOMAIN-SUFFIX", domain)
+    # ── hosts format: "0.0.0.0 ads.example.com" ──────────────────────────────
+    for pfx in _HOSTS_PREFIX:
+        if line.startswith(pfx):
+            parts = line.split()
+            if len(parts) < 2:
+                return None
+            domain = parts[1].lower()
+            if domain in _HOSTS_SKIP:
+                return None
+            return f"DOMAIN,{domain}"
+
+    # ── ABP format: "||ads.example.com^" ─────────────────────────────────────
+    if line.startswith("||"):
+        inner = line[2:].split("$")[0].rstrip("^").lower()
+        if "/" in inner or "*" in inner or not inner:
+            return None
+        inner = inner.split(":")[0]  # strip port
+        return f"DOMAIN-SUFFIX,{inner}"
+
+    # ── Loon / Surge / QX / Shadowrocket format ───────────────────────────────
+    parts = _SPLIT_RE.split(line, maxsplit=2)
+    if len(parts) < 2:
         return None
 
-    # Standard prefix,value[,policy]
-    if "," in line:
-        parts = line.split(",", 2)
-        prefix = parts[0].strip().upper()
-        value  = parts[1].strip().lower()
+    prefix = parts[0].upper()
+    value  = parts[1].strip().lower()
+    prefix = _QX_MAP.get(prefix, prefix)
 
-        canonical = _PREFIX_MAP.get(prefix)
-        if canonical is None:
-            return None   # unknown prefix
+    if prefix not in _VALID_PREFIXES or not value:
+        return None
 
-        if canonical in ("DOMAIN", "DOMAIN-SUFFIX"):
-            # Strip trailing wildcard dot
-            value = value.lstrip("*.")
-            if not _is_valid_domain(value):
-                return None
-            if _is_ip(value):
-                return None
-            return Rule(canonical, value)
+# ── Loon / Surge / QX / Shadowrocket format ───────────────────────────────
+    parts = _SPLIT_RE.split(line, maxsplit=2)
+    if len(parts) < 2:
+        return None
 
-        if canonical == "DOMAIN-KEYWORD":
-            return Rule(canonical, value)
+    prefix = parts[0].upper()
+    value  = parts[1].strip().lower()
+    prefix = _QX_MAP.get(prefix, prefix)
 
-        if canonical in ("IP-CIDR", "IP-CIDR6"):
-            # Basic validation
-            try:
-                ipaddress.ip_network(value, strict=False)
-            except ValueError:
-                return None
-            return Rule(canonical, value)
+    if prefix not in _VALID_PREFIXES or not value:
+        return None
 
-    # Plain domain (no prefix, no comma)
-    candidate = line.lower().lstrip("*.")
-    if _is_valid_domain(candidate) and not _is_ip(candidate):
-        return Rule("DOMAIN-SUFFIX", candidate)
-
-    return None
+    # ── 新增：wildcard domain fix ─────────────────────────────────────────────
+    if prefix == "DOMAIN" and "*" in value:
+        value = value.lstrip("*").lstrip(".")
+        if not value:
+            return None
+        prefix = "DOMAIN-WILDCARD"
+    # ─────────────────────────────────────────────────────────────────────────
+    return f"{prefix},{value}"
 
 
-# ──────────────────────────────────────────────
-# Async fetching
-# ──────────────────────────────────────────────
-async def fetch_url(
-    session: aiohttp.ClientSession,
-    url: str,
-    timeout: int = 30,
-    retries: int = 3,
-) -> str:
-    for attempt in range(1, retries + 1):
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                resp.raise_for_status()
-                text = await resp.text(errors="replace")
-                log.info("  ✓ %s  (%d bytes)", url.split("/")[-1], len(text))
-                return text
-        except Exception as exc:
-            log.warning("  attempt %d/%d failed for %s: %s", attempt, retries, url, exc)
-            if attempt < retries:
-                await asyncio.sleep(2 ** attempt)
-    log.error("  ✗ giving up on %s", url)
-    return ""
+# ── domain trie for semantic dedup ────────────────────────────────────────────
+class DomainTrie:
+    """
+    Reversed-label trie.
+      DOMAIN-SUFFIX,example.com  marks node; subsumes all subdomains & exact
+      DOMAIN,ads.example.com     dropped if any ancestor is suffix-blocked
+      All other rule types bypass the trie entirely
+    """
+    __slots__ = ("children", "suffix_blocked")
+
+    def __init__(self):
+        self.children: dict[str, "DomainTrie"] = {}
+        self.suffix_blocked: bool = False
+
+    @staticmethod
+    def _labels(domain: str) -> list[str]:
+        return domain.rstrip(".").split(".")[::-1]
+
+    def try_insert(self, rule: str) -> bool:
+        """Return True = keep, False = redundant."""
+        prefix, _, value = rule.partition(",")
+
+        if prefix not in ("DOMAIN", "DOMAIN-SUFFIX"):
+            return True
+
+        labels = self._labels(value)
+
+        if prefix == "DOMAIN-SUFFIX":
+            return self._insert_suffix(labels)
+        else:
+            return self._insert_exact(labels)
+
+    def _insert_suffix(self, labels: list[str]) -> bool:
+        node = self
+        for label in labels:
+            if node.suffix_blocked:
+                return False
+            node = node.children.setdefault(label, DomainTrie())
+        if node.suffix_blocked:
+            return False
+        node.suffix_blocked = True
+        node.children.clear()  # prune redundant subtree
+        return True
+
+    def _insert_exact(self, labels: list[str]) -> bool:
+        node = self
+        for label in labels:
+            if node.suffix_blocked:
+                return False
+            if label not in node.children:
+                return True    # path absent → not covered
+            node = node.children[label]
+        return True
 
 
-async def fetch_all(sources: list[dict]) -> list[tuple[str, str]]:
-    """Returns list of (url, content)."""
-    connector = aiohttp.TCPConnector(limit=10)
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; rule-merger/1.0)"}
-    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        tasks = [fetch_url(session, s["url"]) for s in sources]
+# ── fetching ──────────────────────────────────────────────────────────────────
+async def _fetch_http(session, name: str, url: str) -> tuple[str, list[str]]:
+    try:
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+        ) as r:
+            r.raise_for_status()
+            text  = await r.text(errors="replace")
+            rules = [n for line in text.splitlines() if (n := normalise_line(line))]
+            log.info("%-35s  fetched %7d rules", name, len(rules))
+            return name, rules
+    except Exception as exc:
+        log.warning("%-35s  FAILED – %s", name, exc)
+        return name, []
+
+
+async def _fetch_local(name: str, rel_path: str) -> tuple[str, list[str]]:
+    p = ROOT / rel_path
+    if not p.exists():
+        log.warning("%-35s  file not found: %s", name, p)
+        return name, []
+    text  = p.read_text(encoding="utf-8", errors="replace")
+    rules = [n for line in text.splitlines() if (n := normalise_line(line))]
+    log.info("%-35s  loaded  %7d rules", name, len(rules))
+    return name, rules
+
+
+async def fetch_all_async(sources: list[dict]) -> dict[str, list[str]]:
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = []
+        for s in sources:
+            if "url" in s:
+                tasks.append(_fetch_http(session, s["name"], s["url"]))
+            elif "path" in s:
+                tasks.append(_fetch_local(s["name"], s["path"]))
         results = await asyncio.gather(*tasks)
-    return [(sources[i]["url"], results[i]) for i in range(len(sources))]
+    return dict(results)
 
 
-# ──────────────────────────────────────────────
-# Main pipeline
-# ──────────────────────────────────────────────
-def process(
-    raw_pairs: list[tuple[str, str]],
-) -> tuple[list[str], list[str], list[str], dict]:
-    """
-    Returns (domain_rules, keyword_rules, ip_rules, stats).
-    domain_rules / keyword_rules / ip_rules are sorted lists of Loon-format strings.
-    """
-    trie = DomainTrie()
-    keywords: set[str] = set()
-    ip_rules: set[str] = set()
-
-    stats = {
-        "sources": len(raw_pairs),
-        "raw_lines": 0,
-        "parsed": 0,
-        "domain_exact_inserted": 0,
-        "domain_suffix_inserted": 0,
-        "domain_redundant": 0,
-        "keyword": 0,
-        "ip": 0,
-    }
-
-    for url, content in raw_pairs:
-        lines = content.splitlines()
-        stats["raw_lines"] += len(lines)
-        for raw in lines:
-            rule = parse_line(raw)
-            if rule is None:
-                continue
-            stats["parsed"] += 1
-
-            if rule.kind == "DOMAIN-SUFFIX":
-                ok = trie.insert_suffix(rule.value)
-                if ok:
-                    stats["domain_suffix_inserted"] += 1
-                else:
-                    stats["domain_redundant"] += 1
-
-            elif rule.kind == "DOMAIN":
-                ok = trie.insert_exact(rule.value)
-                if ok:
-                    stats["domain_exact_inserted"] += 1
-                else:
-                    stats["domain_redundant"] += 1
-
-            elif rule.kind == "DOMAIN-KEYWORD":
-                keywords.add(rule.value)
-                stats["keyword"] += 1
-
-            elif rule.kind in ("IP-CIDR", "IP-CIDR6"):
-                ip_rules.add(f"{rule.kind},{rule.value},REJECT")
-                stats["ip"] += 1
-
-    # Emit domain rules from trie
-    domain_out: list[str] = []
-    for rtype, domain in trie.emit():
-        domain_out.append(f"{rtype},{domain},REJECT")
-    domain_out.sort()
-
-    kw_out = sorted(f"DOMAIN-KEYWORD,{k},REJECT" for k in keywords)
-    ip_out = sorted(ip_rules)
-
-    stats["domain_output"] = len(domain_out)
-    stats["keyword_output"] = len(kw_out)
-    stats["ip_output"] = len(ip_out)
-    stats["total_output"] = len(domain_out) + len(kw_out) + len(ip_out)
-
-    return domain_out, kw_out, ip_out, stats
-
-
-def write_output(
-    path: Path,
-    domain_rules: list[str],
-    keyword_rules: list[str],
-    ip_rules: list[str],
-    sources: list[dict],
-    stats: dict,
-    elapsed: float,
-) -> None:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    header_lines = [
-        "#!name=Merged Ad-Block Rules",
-        "#!desc=Auto-generated by rule-merger. Do not edit manually.",
-        f"# Updated : {now}",
-        f"# Elapsed : {elapsed:.1f}s",
-        f"# Sources : {stats['sources']}",
-        f"# Raw lines parsed : {stats['raw_lines']:,}",
-        f"# Rules parsed     : {stats['parsed']:,}",
-        f"# Redundant dropped: {stats['domain_redundant']:,}",
-        f"# Output rules     : {stats['total_output']:,}",
-        f"#   DOMAIN/SUFFIX  : {stats['domain_output']:,}",
-        f"#   DOMAIN-KEYWORD : {stats['keyword_output']:,}",
-        f"#   IP-CIDR        : {stats['ip_output']:,}",
-        "#",
-        "# Source URLs:",
-    ]
+def fetch_all_sync(sources: list[dict]) -> dict[str, list[str]]:
+    """Fallback: sequential urllib, no aiohttp needed."""
+    out = {}
     for s in sources:
-        header_lines.append(f"#   {s['url']}")
-    header_lines.append("")
+        name = s["name"]
+        if "path" in s:
+            p = ROOT / s["path"]
+            if not p.exists():
+                log.warning("%-35s  file not found: %s", name, p)
+                out[name] = []
+                continue
+            text = p.read_text(encoding="utf-8", errors="replace")
+            out[name] = [n for line in text.splitlines() if (n := normalise_line(line))]
+            log.info("%-35s  loaded  %7d rules", name, len(out[name]))
+            continue
+        try:
+            req = urllib.request.Request(
+                s["url"], headers={"User-Agent": "rule-merger/2.0"}
+            )
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+            rules = [n for line in text.splitlines() if (n := normalise_line(line))]
+            log.info("%-35s  fetched %7d rules", name, len(rules))
+            out[name] = rules
+        except Exception as exc:
+            log.warning("%-35s  FAILED – %s", name, exc)
+            out[name] = []
+    return out
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        f.write("\n".join(header_lines) + "\n")
-        if domain_rules:
-            f.write("\n# ── Domain / Domain-Suffix ──\n")
-            f.write("\n".join(domain_rules) + "\n")
-        if keyword_rules:
-            f.write("\n# ── Domain-Keyword ──\n")
-            f.write("\n".join(keyword_rules) + "\n")
-        if ip_rules:
-            f.write("\n# ── IP-CIDR ──\n")
-            f.write("\n".join(ip_rules) + "\n")
 
-    log.info("Output written: %s  (%d rules)", path, stats["total_output"])
+# ── merge ─────────────────────────────────────────────────────────────────────
+def merge(results: dict[str, list[str]], custom_name: str | None) -> list[str]:
+    """
+    Pass 1 – all non-custom sources through DomainTrie semantic dedup
+    Pass 2 – custom source appended directly, bypassing trie
+    """
+    trie       = DomainTrie()
+    merged     = []
+    total_in   = 0
+    total_drop = 0
 
+    custom_rules = results.pop(custom_name, []) if custom_name else []
 
-# ──────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────
-def load_config(config_path: Path) -> dict:
-    with config_path.open() as f:
-        return yaml.safe_load(f)
-
-
-async def main() -> None:
-    repo_root   = Path(__file__).resolve().parents[1]
-    config_path = repo_root / "scripts" / "config.yml"
-    output_path = repo_root / "output" / "reject.list"
-
-    cfg     = load_config(config_path)
-    sources = cfg["sources"]
-
-    log.info("Fetching %d source lists…", len(sources))
-    t0 = time.monotonic()
-    raw_pairs = await fetch_all(sources)
-
-    log.info("Processing rules…")
-    domain_rules, keyword_rules, ip_rules, stats = process(raw_pairs)
-    elapsed = time.monotonic() - t0
+    for rules in results.values():
+        for rule in rules:
+            total_in += 1
+            if trie.try_insert(rule):
+                merged.append(rule)
+            else:
+                total_drop += 1
 
     log.info(
-        "Done in %.1fs — parsed %s rules, output %s (dropped %s redundant)",
-        elapsed,
-        f"{stats['parsed']:,}",
-        f"{stats['total_output']:,}",
-        f"{stats['domain_redundant']:,}",
+        "Trie dedup: %d in → %d kept, %d redundant dropped",
+        total_in, len(merged), total_drop,
     )
 
-    write_output(output_path, domain_rules, keyword_rules, ip_rules, sources, stats, elapsed)
+    if custom_rules:
+        merged.extend(custom_rules)
+        log.info("Custom rules appended: %d (bypass trie)", len(custom_rules))
+
+    return merged
+
+
+# ── output ────────────────────────────────────────────────────────────────────
+def write_output(rules: list[str], sources: list[dict]) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    source_lines = "\n".join(
+        f"#   [{i+1:02d}] {s['name']}: {s.get('url', s.get('path', ''))}"
+        for i, s in enumerate(sources)
+    )
+
+    header = (
+        f"# {'='*60}\n"
+        f"#  Ad-block reject rules – Loon format\n"
+        f"#  Generated : {now}\n"
+        f"#  Rules     : {len(rules):,}\n"
+        f"#  Sources   :\n"
+        f"{source_lines}\n"
+        f"# {'='*60}\n\n"
+    )
+
+    with open(OUTPUT, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.write("\n".join(rules))
+        f.write("\n")
+
+    log.info("Written %d rules → %s", len(rules), OUTPUT)
+
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
+def load_sources() -> tuple[list[dict], str | None]:
+    with open(SOURCES, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    active      = [s for s in cfg["sources"] if s.get("enabled", True)]
+    custom_name = next(
+        (s["name"] for s in active if s.get("custom", False)), None
+    )
+    log.info(
+        "Loaded %d active source(s)%s",
+        len(active),
+        f"  (custom: {custom_name})" if custom_name else "",
+    )
+    return active, custom_name
+
+
+def main() -> None:
+    sources, custom_name = load_sources()
+
+    if HAS_AIOHTTP:
+        results = asyncio.run(fetch_all_async(sources))
+    else:
+        log.warning("aiohttp not found – falling back to sequential urllib")
+        results = fetch_all_sync(sources)
+
+    failed = [n for n, r in results.items() if not r]
+    if failed:
+        log.warning("No rules returned from: %s", ", ".join(failed))
+
+    merged = merge(results, custom_name)
+
+    if not merged:
+        log.error("Zero rules after merge – aborting to protect existing output")
+        sys.exit(1)
+
+    write_output(merged, sources)
+    log.info("Done. Total unique rules: %d", len(merged))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-    
+    main()

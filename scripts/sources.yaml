@@ -1,0 +1,63 @@
+# Ad-block rule sources
+# ─────────────────────────────────────────────────────────────────────────────
+# url:     remote HTTP source
+# path:    local file (relative to repo root)
+# enabled: false = suspend without deleting
+# custom:  true  = bypass trie dedup, always kept in output
+# ─────────────────────────────────────────────────────────────────────────────
+
+sources:
+
+  # ── Remote sources ──────────────────────────────────────────────────────────
+
+  - name: adrules-quixoticheart
+    url: https://github.com/QuixoticHeart/rule-set/raw/refs/heads/ruleset/loon/adrules.list
+    enabled: true
+
+  - name: anti-ad
+    url: https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/anti-ad-surge.txt
+    enabled: true
+
+  - name: goodbyeads-qx
+    url: https://raw.githubusercontent.com/8680/GOODBYEADS/master/data/rules/qx.list
+    enabled: true
+
+  - name: goodbyeads-full
+    url: https://raw.githubusercontent.com/8680/GOODBYEADS/master/data/rules/adblock.txt
+    enabled: false
+
+  - name: shadowrocket-reject
+    url: https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_reject_list.module
+    enabled: true
+
+  - name: adrules-top
+    url: https://adrules.top/adrules.list
+    enabled: true
+
+  - name: adblockfilters-loon
+    url: https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockloon.list
+    enabled: true
+
+  - name: blackmatrix7-advertising
+    url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Loon/Advertising/Advertising.list
+    enabled: true
+
+  - name: adguard-dns-filter
+    url: https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
+    enabled: true
+
+  - name: hagezi-pro
+    url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt
+    enabled: true
+
+  - name: stevenblack-hosts
+    url: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+    enabled: true
+
+  # ── Local custom deny list ───────────────────────────────────────────────────
+  # custom: true → bypass trie dedup, always appended to output as-is
+
+  - name: custom-deny
+    path: custom_deny.list
+    custom: true
+    enabled: true
