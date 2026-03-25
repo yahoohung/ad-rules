@@ -1,22 +1,24 @@
-name: Update Merged Ad-Block Rules
+name: Update reject rules
 
 on:
   schedule:
-    # Run every day at 03:00 UTC (11:00 HKT)
-    - cron: "0 3 * * *"
-  workflow_dispatch:   # allow manual trigger from Actions tab
+    # 每日 02:00 UTC (Hong Kong 10:00)
+    - cron: "0 2 * * *"
+  workflow_dispatch:   # 允許手動觸發
 
 permissions:
-  contents: write
+  contents: write      # 允許 GITHUB_TOKEN push
 
 jobs:
-  merge:
+  update:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1   # shallow clone 夠用
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,25 +29,19 @@ jobs:
       - name: Install dependencies
         run: pip install aiohttp pyyaml
 
-      - name: Run merge script
-        run: python scripts/merge.py
+      - name: Run merger
+        run: python merge.py
 
-      - name: Check for changes
-        id: diff
-        run: |
-          if git diff --quiet output/reject.list 2>/dev/null && \
-             git ls-files --error-unmatch output/reject.list 2>/dev/null; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Commit and push if changed
-        if: steps.diff.outputs.changed == 'true'
+      - name: Commit & push (only if changed)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/reject.list
-          RULE_COUNT=$(grep -c "^DOMAIN\|^IP-CIDR" output/reject.list || true)
-          git commit -m "chore: update rules [${RULE_COUNT} rules] $(date -u '+%Y-%m-%d %H:%M UTC')"
-          git push
+          git add output/
+          # 只有檔案真的有改變先 commit
+          if git diff --cached --quiet; then
+            echo "No changes – skipping commit"
+          else
+            RULES=$(grep -c '^[^#]' output/reject.list || true)
+            git commit -m "chore: update reject rules (${RULES} rules) [$(date -u +%Y-%m-%d)]"
+            git push
+          fi
