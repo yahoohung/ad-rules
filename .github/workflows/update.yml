@@ -30,7 +30,7 @@ jobs:
         run: pip install aiohttp pyyaml
 
       - name: Run merger
-        run: python merge.py
+        run: python scripts/merge.py
 
       - name: Commit & push (only if changed)
         run: |
